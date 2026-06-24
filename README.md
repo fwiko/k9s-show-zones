@@ -9,6 +9,13 @@ monitoring the distribution of workloads to validate enforcement of topology
 spread constraints and effectivness of a
 [descheduler](https://github.com/kubernetes-sigs/descheduler).
 
+## Install 
+```sh
+mkdir -p ~/.config/k9s/plugins && \
+    curl -s https://raw.githubusercontent.com/fwiko/k9s-show-zones/refs/heads/main/show-zones.yaml \
+    -O ~/.config/k9s/plugins/
+```
+
 ## Screenshots
 
 All screenshots show examples based on a **tiebreaker** stretched cluster
