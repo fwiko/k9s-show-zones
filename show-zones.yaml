@@ -1,0 +1,130 @@
+# View nodes and pods grouped by their topology zone; label: topology.kubernetes.io/zone
+plugins:
+  zones-nodes:
+    shortCut: Shift-Z
+    confirm: false
+    description: Show zones
+    scopes:
+      - nodes
+    command: watch
+    background: false
+    args:
+      - -t
+      - -x
+      - -n
+      - "5"
+      - sh
+      - -c
+      - |
+        kubectl get nodes --context "$CONTEXT" \
+          -L topology.kubernetes.io/zone \
+          --sort-by='.metadata.labels.topology\.kubernetes\.io/zone' \
+          | awk 'NR==1 {print; next} seen && $NF!=prev {print ""} {prev=$NF; seen=1; print}'
+
+  zones-pods:
+    shortCut: Shift-Z
+    confirm: false
+    description: Show zone distribution
+    scopes:
+      - pods
+    command: watch
+    background: false
+    args:
+      - -t
+      - -x
+      - -n
+      - "3"
+      - sh
+      - -c
+      - |
+        if [ -n "$NAMESPACE" ]; then scope="-n $NAMESPACE"; amode=0; else scope="-A"; amode=1; fi
+        fmt='%-14s %-18s %-19s %-32s %-16s %9s %7s %7s %7s %9s %7s %7s\n'
+        {
+          kubectl get nodes --context "$CONTEXT" \
+            -o jsonpath='{range .items[*]}__N__ {.metadata.name} {.metadata.labels.topology\.kubernetes\.io/zone}{"\n"}{end}'
+          echo
+          kubectl top pods $scope --context "$CONTEXT" --no-headers 2>/dev/null \
+            | awk -v amode="$amode" -v ns="$NAMESPACE" \
+                '{ if (amode=="1") print "__M__", $1, $2, $3, $4; else print "__M__", ns, $1, $2, $3 }'
+          kubectl get pods $scope --context "$CONTEXT" -o json | jq -r '
+            def cpuMilli: tostring | if endswith("m") then (.[:-1]|tonumber) else (tonumber*1000) end;
+            def memBytes: tostring | capture("(?<n>[0-9.]+)(?<u>[A-Za-z]*)") | (.n|tonumber) as $n | .u as $u |
+              $n * (if $u=="Ki" then 1024 elif $u=="Mi" then 1048576 elif $u=="Gi" then 1073741824
+                    elif $u=="Ti" then 1099511627776 elif $u=="Pi" then 1125899906842624
+                    elif $u=="Ei" then 1152921504606846976
+                    elif ($u=="k" or $u=="K") then 1000 elif $u=="M" then 1000000 elif $u=="G" then 1000000000
+                    elif $u=="T" then 1000000000000 elif $u=="P" then 1000000000000000 else 1 end);
+            def podStatus:
+              . as $p
+              | (($p.status.phase) // "Unknown") as $phase
+              | ($p.status.reason // "") as $podReason
+              | (if $podReason != "" then $podReason else $phase end) as $r0
+              | ($p.status.initContainerStatuses // []) as $ics
+              | ($p.spec.initContainers // []) as $inits
+              | (reduce range(0; ($ics|length)) as $i ({reason:$r0, init:false, done:false};
+                   if .done then . else ($ics[$i]) as $c
+                   | if ($c.state.terminated != null and ($c.state.terminated.exitCode // 0)==0) then .
+                     elif ($c.state.terminated != null) then
+                       (.reason = (if (($c.state.terminated.reason // "")=="")
+                                   then (if (($c.state.terminated.signal // 0)!=0)
+                                         then "Init:Signal:\($c.state.terminated.signal)"
+                                         else "Init:ExitCode:\($c.state.terminated.exitCode)" end)
+                                   else "Init:\($c.state.terminated.reason)" end))
+                       | .init=true | .done=true
+                     elif ($c.state.waiting != null and (($c.state.waiting.reason // "")|length)>0
+                           and $c.state.waiting.reason != "PodInitializing") then
+                       (.reason="Init:\($c.state.waiting.reason)") | .init=true | .done=true
+                     else
+                       (.reason="Init:\($i)/\($inits|length)") | .init=true | .done=true
+                     end
+                   end)) as $is
+              | (if $is.init then $is.reason
+                 else
+                   ($p.status.containerStatuses // []) as $cs
+                   | ([ ($p.status.conditions // [])[] | select(.type=="Ready" and .status=="True") ]|length>0) as $ready
+                   | (reduce range(($cs|length)-1; -1; -1) as $i ({reason:$r0, running:false};
+                        ($cs[$i]) as $c
+                        | if ($c.state.waiting != null and (($c.state.waiting.reason // "")!="")) then (.reason=$c.state.waiting.reason)
+                          elif ($c.state.terminated != null and (($c.state.terminated.reason // "")!="")) then (.reason=$c.state.terminated.reason)
+                          elif ($c.state.terminated != null and (($c.state.terminated.reason // "")=="")) then
+                            (.reason=(if (($c.state.terminated.signal // 0)!=0) then "Signal:\($c.state.terminated.signal)" else "ExitCode:\($c.state.terminated.exitCode)" end))
+                          elif (($c.ready==true) and ($c.state.running != null)) then (.running=true)
+                          else . end
+                      )) as $cstate
+                   | (if ($cstate.reason=="Completed" and $cstate.running) then (if $ready then "Running" else "NotReady" end) else $cstate.reason end)
+                 end) as $r1
+              | (if ($p.metadata.deletionTimestamp != null and $podReason=="NodeLost") then "Unknown"
+                 elif ($p.metadata.deletionTimestamp != null) then "Terminating"
+                 else $r1 end);
+            .items[]
+            | .spec.containers as $c
+            | (.status.containerStatuses // []) as $cs
+            | [.metadata.namespace, .metadata.name, (.spec.nodeName // "<none>"), (podStatus),
+               ([$cs[].restartCount] | add // 0),
+               ([$c[] | .resources.requests.cpu    // empty | cpuMilli] | add // 0),
+               ([$c[] | .resources.limits.cpu      // empty | cpuMilli] | add // 0),
+               ([$c[] | .resources.requests.memory // empty | memBytes] | add // 0),
+               ([$c[] | .resources.limits.memory   // empty | memBytes] | add // 0)]
+            | "__P__ " + (map(tostring) | join(" "))'
+        } | awk -v fmt="$fmt" '
+            function cpum(v){ if (v ~ /m$/){ sub(/m$/,"",v); return v+0 } return (v+0)*1000 }
+            function memb(v,  n){ n=v+0;
+              if (v ~ /Ki$/) return n*1024;       if (v ~ /Mi$/) return n*1048576;
+              if (v ~ /Gi$/) return n*1073741824; if (v ~ /Ti$/) return n*1099511627776;
+              if (v ~ /[Kk]$/) return n*1000;     if (v ~ /M$/) return n*1000000;
+              if (v ~ /G$/) return n*1000000000;  return n }
+            function pct(u,b){ return (b>0) ? sprintf("%d", u*100/b) : "-" }
+            function memMi(b){ return (b>0) ? sprintf("%dMi", int(b/1048576)) : "-" }
+            $1=="__N__" { z[$2]=($3==""?"<none>":$3); next }
+            $1=="__M__" { k=$2 SUBSEP $3; cu[k]=cpum($4); mu[k]=memb($5); have[k]=1; next }
+            $1=="__P__" {
+              ns=$2; name=$3; node=$4; stat=$5; rest=$6; creq=$7; clim=$8; mreq=$9; mlim=$10;
+              zone=(node in z)?z[node]:"<none>"; k=ns SUBSEP name;
+              if (have[k]) { cpuD=sprintf("%dm",cu[k]); memD=memMi(mu[k]);
+                            cpr=pct(cu[k],creq); cpl=pct(cu[k],clim); mpr=pct(mu[k],mreq); mpl=pct(mu[k],mlim) }
+              else { cpuD="-"; memD="-"; cpr="-"; cpl="-"; mpr="-"; mpl="-" }
+              printf fmt, ns, zone, stat, name, node, rest, cpuD, cpr, cpl, memD, mpr, mpl
+            }
+          ' | sort -b -k2,2 -k1,1 | awk 'NR>1 && $2!=prev {print ""} {prev=$2; print}' \
+            | (printf "$fmt" NAMESPACE ZONE STATUS NAME NODE RESTARTS CPU "%CPU/R" "%CPU/L" MEM "%MEM/R" "%MEM/L"; cat)
+
