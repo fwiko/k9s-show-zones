@@ -13,7 +13,7 @@ spread constraints and effectivness of a
 ```sh
 mkdir -p ~/.config/k9s/plugins && \
     curl -s https://raw.githubusercontent.com/fwiko/k9s-show-zones/refs/heads/main/show-zones.yaml \
-    -O ~/.config/k9s/plugins/
+    -o ~/.config/k9s/plugins/show-zones.yaml
 ```
 
 ## Screenshots
